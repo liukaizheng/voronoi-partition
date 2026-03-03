@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug voronoi-partition",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/voronoi-partition",
+            "args": ["-m", "cube_stamped.off"],
+            "cwd": "${workspaceFolder}/build",
+            "env": {},
+            "stopOnEntry": false,
+            "preLaunchTask": "Build voronoi-partition",
+            "console": "integratedTerminal"
+        }
+    ]
+}
