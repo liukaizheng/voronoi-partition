@@ -263,7 +263,7 @@ struct InterfaceMesh {
 auto extract_interface_mesh(
     const std::vector<VoronoiCell>& cells,
     const std::vector<std::size_t>& point_group_indices,
-    double tolerance = 1e-2
+    double tolerance = 1e-3
 ) -> InterfaceMesh {
     InterfaceMesh result;
 
