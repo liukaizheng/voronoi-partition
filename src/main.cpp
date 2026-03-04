@@ -152,32 +152,64 @@ auto compute_edge_offset_points(
     using Vector3 = Eigen::Vector3d;
     std::vector<std::array<double, 3>> seed_points;
     std::vector<std::size_t> point_group_indices;
-    seed_points.reserve(mesh.n_faces_capacity() * 3);
-    point_group_indices.reserve(mesh.n_faces_capacity() * 3);
-    std::array<const double*, 3> pts;
-    for (auto face : mesh.faces()) {
+
+    auto compute_face_normal = [&points](auto face) -> Vector3 {
+        std::array<const double*, 3> pts;
         int i = 0;
         for (auto he : face.halfedges()) {
-            const auto& p = points[he.to().id.idx];
-            pts[i++] = p.data();
+            pts[i++] = points[he.to().id.idx].data();
         }
         auto p1 = Vector3::Map(pts[0]);
         auto p2 = Vector3::Map(pts[1]);
         auto p3 = Vector3::Map(pts[2]);
-        auto normal = (p2 - p1).cross(p3 - p1).normalized();
+        return (p2 - p1).cross(p3 - p1).normalized();
+    };
 
-        auto offset_edge_mid_pt = [&normal, &seed_points, &point_group_indices, offset](auto pa, auto pb, std::size_t region_idx) {
-            auto mid_pt = (pa + pb) * 0.5;
-            auto dir = normal.cross(pb - pa).normalized();
-            seed_points.emplace_back();
-            point_group_indices.emplace_back(region_idx);
-            Vector3::Map(seed_points.back().data()) = mid_pt + dir * offset;
-        };
+    auto push_point = [&seed_points, &point_group_indices](const Vector3& pt, std::size_t region_idx) {
+        seed_points.emplace_back();
+        point_group_indices.emplace_back(region_idx);
+        Vector3::Map(seed_points.back().data()) = pt;
+    };
 
-        auto region_idx = face.prop().region_index;
-        offset_edge_mid_pt(p1, p2, region_idx);
-        offset_edge_mid_pt(p2, p3, region_idx);
-        offset_edge_mid_pt(p3, p1, region_idx);
+    std::vector<bool> visited(mesh.n_vertices_capacity(), false);
+    for (auto edge : mesh.edges()) {
+        auto ha = edge.halfedge();
+        auto hb = ha.twin();
+        auto fa = ha.face();
+        auto fb = hb.face();
+
+        auto region_a = fa.prop().region_index;
+        auto region_b = fb.prop().region_index;
+
+
+        if (region_a != region_b) {
+            auto va = hb.to().id.idx;
+            auto vb = ha.to().id.idx;
+
+            auto pa = Vector3::Map(points[va].data());
+            auto pb = Vector3::Map(points[vb].data());
+            auto mid_pt = ((pa + pb) * 0.5).eval();
+            auto edge_dir = (pb - pa).eval();
+
+            auto normal_a = compute_face_normal(fa);
+            auto dir_a = normal_a.cross(edge_dir).normalized().eval();
+            push_point(mid_pt + dir_a * offset, region_a);
+
+            auto normal_b = compute_face_normal(fb);
+            auto dir_b = normal_b.cross(-edge_dir).normalized().eval();
+            push_point(mid_pt + dir_b * offset, region_b);
+        }
+
+        for (auto v : mesh.vertices()) {
+            if (visited[v.id.idx])  {
+                continue;
+            }
+            visited[v.id.idx] = true;
+
+            auto face = v.halfedge().face();
+            seed_points.push_back(points[v.id.idx]);
+            point_group_indices.push_back(face.prop().region_index);
+        }
     }
 
     return std::make_pair(std::move(seed_points), std::move(point_group_indices));
