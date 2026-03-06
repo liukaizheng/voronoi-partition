@@ -1,3 +1,4 @@
+#include <gpf/ids.hpp>
 #include <iostream>
 #include <CLI/CLI.hpp>
 #include <fstream>
@@ -18,7 +19,7 @@
 #include <CGAL/Delaunay_triangulation_3.h>
 #include <CGAL/Triangulation_vertex_base_with_info_3.h>
 #include <CGAL/Delaunay_triangulation_cell_base_3.h>
-#include <map>
+#include <CGAL/Triangulation_cell_base_with_info_3.h>
 
 namespace ranges = std::ranges;
 namespace views = ranges::views;
@@ -237,28 +238,33 @@ auto compute_edge_offset_points(
     return std::make_pair(std::move(seed_points), std::move(point_group_indices));
 }
 
-struct VoronoiCell {
-    int id;
-    double x, y, z;
-    double volume;
-    std::vector<double> vertices;
-    std::vector<int> face_vertices;
-    std::vector<int> neighbors;
+struct InterfaceMesh {
+    std::vector<std::array<double, 3>> vertices;
+    std::vector<std::vector<std::size_t>> faces;
+    std::vector<std::array<std::size_t, 2>> face_groups;
+};
+struct VertexInfo {
+    std::size_t id{gpf::kInvalidIndex};
+};
+
+struct CellInfo {
+    std::size_t id{gpf::kInvalidIndex};
 };
 
 auto compute_voronoi(
-    const std::vector<std::array<double, 3>>& seed_points
-) {
+    const std::vector<std::array<double, 3>>& seed_points,
+    const std::vector<std::size_t>& point_group_indices,
+    double tolerance = 1e-3
+) -> InterfaceMesh {
     using K = CGAL::Exact_predicates_inexact_constructions_kernel;
-    using Vb = CGAL::Triangulation_vertex_base_with_info_3<int, K>;
-    using Cb = CGAL::Delaunay_triangulation_cell_base_3<K>;
+    using Vb = CGAL::Triangulation_vertex_base_with_info_3<VertexInfo, K>;
+    using Cb = CGAL::Triangulation_cell_base_with_info_3<CellInfo, K, CGAL::Delaunay_triangulation_cell_base_3<K>>;
     using Tds = CGAL::Triangulation_data_structure_3<Vb, Cb>;
     using Delaunay = CGAL::Delaunay_triangulation_3<K, Tds>;
     using Point_3 = K::Point_3;
     using Vertex_handle = Delaunay::Vertex_handle;
     using Cell_handle = Delaunay::Cell_handle;
-
-    int n = static_cast<int>(seed_points.size());
+    using Vector3 = Eigen::Vector3d;
 
     // Compute bounding box
     double min_x = std::numeric_limits<double>::max();
@@ -283,11 +289,11 @@ auto compute_voronoi(
     Delaunay dt;
 
     // Insert original points with their IDs
-    std::vector<Vertex_handle> vertex_handles(n);
-    for (int i = 0; i < n; ++i) {
+    std::vector<Vertex_handle> vertex_handles(seed_points.size());
+    for (std::size_t i = 0; i < seed_points.size(); ++i) {
         vertex_handles[i] = dt.insert(
             Point_3(seed_points[i][0], seed_points[i][1], seed_points[i][2]));
-        vertex_handles[i]->info() = i;
+        vertex_handles[i]->info().id = i;
     }
 
     // Insert 8 sentinel corner points (far outside the data).
@@ -295,103 +301,20 @@ auto compute_voronoi(
     // co-spherical degeneracies that would stress the arithmetic filter.
     constexpr double scale[] = {1.0, 1.01, 1.02, 1.03, 1.04, 1.05, 1.06, 1.07};
     int si = 0;
-    for (int sx : {-1, 1})
-        for (int sy : {-1, 1})
+    for (int sx : {-1, 1}) {
+        for (int sy : {-1, 1}) {
             for (int sz : {-1, 1}) {
                 double f = scale[si++];
                 dt.insert(Point_3(cx + sx * pad * f,
                                   cy + sy * pad * f,
-                                  cz + sz * pad * f))
-                    ->info() = -1;
+                                  cz + sz * pad * f));
             }
-
-    std::vector<VoronoiCell> cells;
-    cells.reserve(n);
-
-    for (int i = 0; i < n; ++i) {
-        Vertex_handle vh = vertex_handles[i];
-        VoronoiCell cell;
-        cell.id = i;
-        cell.x = seed_points[i][0];
-        cell.y = seed_points[i][1];
-        cell.z = seed_points[i][2];
-
-        // Incident Delaunay cells → Voronoi vertices (circumcenters)
-        std::vector<Cell_handle> inc_cells;
-        dt.incident_cells(vh, std::back_inserter(inc_cells));
-
-        auto cell_less = [](Cell_handle a, Cell_handle b) {
-            return &*a < &*b;
-        };
-        std::map<Cell_handle, int, decltype(cell_less)> cell_to_vidx(cell_less);
-
-        for (auto ch : inc_cells) {
-            if (dt.is_infinite(ch)) continue;
-            int vidx = static_cast<int>(cell.vertices.size() / 3);
-            Point_3 cc = dt.dual(ch);
-            cell.vertices.push_back(cc.x());
-            cell.vertices.push_back(cc.y());
-            cell.vertices.push_back(cc.z());
-            cell_to_vidx[ch] = vidx;
         }
-
-        // Adjacent Delaunay vertices → Voronoi neighbors + face structure
-        std::vector<Vertex_handle> adj_verts;
-        dt.adjacent_vertices(vh, std::back_inserter(adj_verts));
-
-        for (auto adj_vh : adj_verts) {
-            if (dt.is_infinite(adj_vh)) continue;
-
-            int neighbor_id = adj_vh->info();
-            // Sentinel neighbors represent the bounding-box walls
-            cell.neighbors.push_back(neighbor_id < 0 ? -1 : neighbor_id);
-
-            // Find edge (vh, adj_vh) and circulate to get ordered face vertices
-            Cell_handle ec;
-            int ei, ej;
-            dt.is_edge(vh, adj_vh, ec, ei, ej);
-
-            auto circ = dt.incident_cells(ec, ei, ej);
-            auto done = circ;
-            auto face_start = cell.face_vertices.size();
-            cell.face_vertices.push_back(0); // placeholder for vertex count
-            int n_face_verts = 0;
-            do {
-                Cell_handle ch = circ;
-                auto it = cell_to_vidx.find(ch);
-                if (it != cell_to_vidx.end()) {
-                    cell.face_vertices.push_back(it->second);
-                    ++n_face_verts;
-                }
-                ++circ;
-            } while (circ != done);
-            cell.face_vertices[face_start] = n_face_verts;
-        }
-
-        cell.volume = 0.0;
-        cells.push_back(std::move(cell));
     }
 
-    // Sort by id so the output order matches the input seed order
-    std::sort(cells.begin(), cells.end(),
-        [](const VoronoiCell& a, const VoronoiCell& b) { return a.id < b.id; });
-
-    return cells;
-}
-
-struct InterfaceMesh {
-    std::vector<std::array<double, 3>> vertices;
-    std::vector<std::vector<std::size_t>> faces;
-    std::vector<std::array<std::size_t, 2>> face_groups;
-};
-
-auto extract_interface_mesh(
-    const std::vector<VoronoiCell>& cells,
-    const std::vector<std::size_t>& point_group_indices,
-    double tolerance = 1e-3
-) -> InterfaceMesh {
     InterfaceMesh result;
 
+    // Vertex deduplication
     double inv_tol = 1.0 / tolerance;
     double tol_sq = tolerance * tolerance;
 
@@ -430,59 +353,72 @@ auto extract_interface_mesh(
         return idx;
     };
 
-    for (const auto& cell : cells) {
-        std::size_t my_group = point_group_indices[cell.id];
+    // Iterate all finite edges: extract Voronoi faces at group boundaries
+    for (auto eit : dt.finite_edges()) {
+        auto c = eit.first;
+        auto i = eit.second;
+        auto j = eit.third;
+        auto va = c->vertex(i);
+        auto vb = c->vertex(j);
 
-        for (std::size_t i = 0, j = 0; i < cell.neighbors.size(); ++i) {
-            int n_verts = cell.face_vertices[j];
-            int neighbor_id = cell.neighbors[i];
+        auto id_a = va->info().id;
+        auto id_b = vb->info().id;
 
-            bool is_boundary = neighbor_id < 0;
-            bool is_interface = neighbor_id >= 0
-                && cell.id < neighbor_id
-                && static_cast<std::size_t>(neighbor_id) < point_group_indices.size()
-                && my_group != point_group_indices[neighbor_id];
+        // Skip edges involving sentinel vertices
 
-            if (is_boundary || is_interface) {
-                std::vector<std::size_t> face;
-                face.reserve(n_verts);
-                for (int k = 0; k < n_verts; ++k) {
-                    int vi = cell.face_vertices[j + 1 + k];
-                    auto idx = get_or_insert(
-                        cell.vertices[3 * vi],
-                        cell.vertices[3 * vi + 1],
-                        cell.vertices[3 * vi + 2]
-                    );
-                    if (face.empty() || face.back() != idx) {
-                        face.push_back(idx);
-                    }
-                }
-                // Remove wrap-around duplicate
-                if (face.size() > 1 && face.front() == face.back()) {
-                    face.pop_back();
-                }
-                auto face_set = face | ranges::to<std::unordered_set>();
-                if (face_set.size() != face.size()) {
-                    const auto a = 2;
-                }
-                if (face.size() >= 3) {
-                    result.faces.push_back(std::move(face));
-                    if (is_boundary) {
-                        result.face_groups.push_back(
-                            {gpf::kInvalidIndex, my_group});
-                    } else {
-                        result.face_groups.push_back(
-                            {point_group_indices[neighbor_id], my_group});
-                    }
+        auto group_a = id_a == gpf::kInvalidIndex ? gpf::kInvalidIndex : point_group_indices[id_a];
+        auto group_b = id_b == gpf::kInvalidIndex ? gpf::kInvalidIndex : point_group_indices[id_b];
+
+        // Skip same-group edges
+        if (group_a == group_b) {
+            continue;
+        }
+
+        // Collect Voronoi face vertices (circumcenters of incident cells)
+        auto circ = dt.incident_cells(eit);
+        auto done = circ;
+        std::vector<std::size_t> face;
+        do {
+            Cell_handle ch = circ;
+            if (!dt.is_infinite(ch)) {
+                Point_3 cc = dt.dual(ch);
+                auto idx = get_or_insert(cc.x(), cc.y(), cc.z());
+                if (face.empty() || face.back() != idx) {
+                    face.push_back(idx);
                 }
             }
+            ++circ;
+        } while (circ != done);
 
-            j += n_verts + 1;
+        // Remove wrap-around duplicate
+        if (face.size() > 1 && face.front() == face.back()) {
+            face.pop_back();
         }
+
+        if (face.size() < 3) continue;
+
+        // Orient: face normal should point toward vertex with smaller group index
+        auto target_id = group_a < group_b ? id_a : id_b;
+        Vector3 target_pt = Vector3::Map(seed_points[target_id].data());
+
+        Vector3 p0 = Vector3::Map(result.vertices[face[0]].data());
+        Vector3 p1 = Vector3::Map(result.vertices[face[1]].data());
+        Vector3 p2 = Vector3::Map(result.vertices[face[2]].data());
+        Vector3 face_normal = (p1 - p0).cross(p2 - p0);
+        Vector3 face_center = (p0 + p1 + p2) / 3.0;
+
+        if (face_normal.dot(target_pt - face_center) < 0) {
+            std::reverse(face.begin(), face.end());
+        }
+
+        result.faces.push_back(std::move(face));
+        auto [smaller_group, larger_group] = std::minmax(group_a, group_b);
+        result.face_groups.push_back({smaller_group, larger_group});
     }
 
     return result;
 }
+
 
 void write_seed_points(const std::string& path,
                        const std::vector<std::array<double, 3>>& seed_points,
@@ -537,13 +473,9 @@ int main(int argc, char** argv) {
     auto [seed_points,  point_group_indices] = compute_edge_offset_points(points, mesh, region_colors.size());
     write_seed_points(seed_path, seed_points, point_group_indices);
 
-    auto cells = compute_voronoi(seed_points);
-
-    auto interface_mesh = extract_interface_mesh(cells, point_group_indices);
+    auto interface_mesh = compute_voronoi(seed_points, point_group_indices);
     write_off(output_path, interface_mesh);
 
-    std::cout << "Computed " << cells.size() << " Voronoi cells from "
-              << seed_points.size() << " seed points\n";
     std::cout << "Interface mesh: " << interface_mesh.vertices.size() << " vertices, "
               << interface_mesh.faces.size() << " faces\n";
     std::cout << "Written to: " << output_path << "\n";

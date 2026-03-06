@@ -6,7 +6,7 @@
             "type": "lldb",
             "request": "launch",
             "program": "${workspaceFolder}/build/voronoi-partition",
-            "args": ["-m", "bunny_stamped.off"],
+            "args": ["-m", "cube_stamped.off"],
             "cwd": "${workspaceFolder}/build",
             "env": {},
             "stopOnEntry": false,
