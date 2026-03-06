@@ -11,8 +11,7 @@ include(cmake/CPM.cmake)
 
 CPMAddPackage("gh:CLIUtils/CLI11#v2.6.1")
 CPMAddPackage("gh:liukaizheng/gpf-algorithm#main")
-CPMAddPackage("gh:chr1shr/voro#master")
-
+find_package(CGAL REQUIRED)
 
 add_executable(voronoi-partition
     src/main.cpp
@@ -22,7 +21,7 @@ target_compile_features(voronoi-partition PRIVATE cxx_std_23)
 target_link_libraries(voronoi-partition PRIVATE
     CLI11::CLI11
     gpf::algorithm
-    voro++
+    CGAL::CGAL
 )
 target_include_directories(voronoi-partition PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -30,9 +29,9 @@ target_include_directories(voronoi-partition PRIVATE
 
 target_compile_options(voronoi-partition PRIVATE
     # -Wall -Wextra -Wpedantic
-    -fsanitize=address -fno-omit-frame-pointer
+    # -fsanitize=address -fno-omit-frame-pointer
 )
 
 target_link_options(voronoi-partition PRIVATE
-    -fsanitize=address
+    # -fsanitize=address
 )

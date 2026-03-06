@@ -32,7 +32,6 @@
             },
             "dependsOn": "Configure voronoi-partition (Debug)",
             "problemMatcher": [
-                "$gcc"
             ]
         }
     ]

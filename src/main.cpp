@@ -14,7 +14,11 @@
 #include <gpf/mesh.hpp>
 #include <unordered_set>
 #include <vector>
-#include <voro++.hh>
+#include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#include <CGAL/Delaunay_triangulation_3.h>
+#include <CGAL/Triangulation_vertex_base_with_info_3.h>
+#include <CGAL/Delaunay_triangulation_cell_base_3.h>
+#include <map>
 
 namespace ranges = std::ranges;
 namespace views = ranges::views;
@@ -245,7 +249,18 @@ struct VoronoiCell {
 auto compute_voronoi(
     const std::vector<std::array<double, 3>>& seed_points
 ) {
-    // Compute bounding box with padding
+    using K = CGAL::Exact_predicates_inexact_constructions_kernel;
+    using Vb = CGAL::Triangulation_vertex_base_with_info_3<int, K>;
+    using Cb = CGAL::Delaunay_triangulation_cell_base_3<K>;
+    using Tds = CGAL::Triangulation_data_structure_3<Vb, Cb>;
+    using Delaunay = CGAL::Delaunay_triangulation_3<K, Tds>;
+    using Point_3 = K::Point_3;
+    using Vertex_handle = Delaunay::Vertex_handle;
+    using Cell_handle = Delaunay::Cell_handle;
+
+    int n = static_cast<int>(seed_points.size());
+
+    // Compute bounding box
     double min_x = std::numeric_limits<double>::max();
     double min_y = min_x, min_z = min_x;
     double max_x = std::numeric_limits<double>::lowest();
@@ -257,45 +272,105 @@ auto compute_voronoi(
         min_z = std::min(min_z, p[2]); max_z = std::max(max_z, p[2]);
     }
 
-    // Add padding so boundary cells are well-formed
-    // double pad_x = (max_x - min_x) * 0.0 + 1e-6;
-    // double pad_y = (max_y - min_y) * 0.0 + 1e-6;
-    // double pad_z = (max_z - min_z) * 0.0 + 1e-6;
-    // min_x -= pad_x; max_x += pad_x;
-    // min_y -= pad_y; max_y += pad_y;
-    // min_z -= pad_z; max_z += pad_z;
+    // Sentinel points placed far outside ensure all original points are
+    // interior to the convex hull, so all their incident Delaunay cells
+    // are finite and produce well-defined Voronoi vertices (circumcenters).
+    double pad = std::max({max_x - min_x, max_y - min_y, max_z - min_z, 1.0});
+    double cx = (min_x + max_x) / 2.0;
+    double cy = (min_y + max_y) / 2.0;
+    double cz = (min_z + max_z) / 2.0;
 
-    // Choose grid resolution based on particle count
-    int n = static_cast<int>(seed_points.size());
-    int n_blocks = std::max(1, static_cast<int>(std::cbrt(n / 5.0)));
+    Delaunay dt;
 
-    voro::container con(
-        min_x, max_x, min_y, max_y, min_z, max_z,
-        n_blocks, n_blocks, n_blocks,
-        false, false, false, 8
-    );
-
+    // Insert original points with their IDs
+    std::vector<Vertex_handle> vertex_handles(n);
     for (int i = 0; i < n; ++i) {
-        con.put(i, seed_points[i][0], seed_points[i][1], seed_points[i][2]);
+        vertex_handles[i] = dt.insert(
+            Point_3(seed_points[i][0], seed_points[i][1], seed_points[i][2]));
+        vertex_handles[i]->info() = i;
     }
+
+    // Insert 8 sentinel corner points (far outside the data).
+    // Each corner uses a unique scale factor to break co-planar and
+    // co-spherical degeneracies that would stress the arithmetic filter.
+    constexpr double scale[] = {1.0, 1.01, 1.02, 1.03, 1.04, 1.05, 1.06, 1.07};
+    int si = 0;
+    for (int sx : {-1, 1})
+        for (int sy : {-1, 1})
+            for (int sz : {-1, 1}) {
+                double f = scale[si++];
+                dt.insert(Point_3(cx + sx * pad * f,
+                                  cy + sy * pad * f,
+                                  cz + sz * pad * f))
+                    ->info() = -1;
+            }
 
     std::vector<VoronoiCell> cells;
     cells.reserve(n);
 
-    voro::voronoicell_neighbor c;
-    voro::c_loop_all loop(con);
-    if (loop.start()) do {
-        if (con.compute_cell(c, loop)) {
-            VoronoiCell cell;
-            cell.id = loop.pid();
-            loop.pos(cell.x, cell.y, cell.z);
-            cell.volume = c.volume();
-            c.vertices(cell.x, cell.y, cell.z, cell.vertices);
-            c.face_vertices(cell.face_vertices);
-            c.neighbors(cell.neighbors);
-            cells.push_back(std::move(cell));
+    for (int i = 0; i < n; ++i) {
+        Vertex_handle vh = vertex_handles[i];
+        VoronoiCell cell;
+        cell.id = i;
+        cell.x = seed_points[i][0];
+        cell.y = seed_points[i][1];
+        cell.z = seed_points[i][2];
+
+        // Incident Delaunay cells → Voronoi vertices (circumcenters)
+        std::vector<Cell_handle> inc_cells;
+        dt.incident_cells(vh, std::back_inserter(inc_cells));
+
+        auto cell_less = [](Cell_handle a, Cell_handle b) {
+            return &*a < &*b;
+        };
+        std::map<Cell_handle, int, decltype(cell_less)> cell_to_vidx(cell_less);
+
+        for (auto ch : inc_cells) {
+            if (dt.is_infinite(ch)) continue;
+            int vidx = static_cast<int>(cell.vertices.size() / 3);
+            Point_3 cc = dt.dual(ch);
+            cell.vertices.push_back(cc.x());
+            cell.vertices.push_back(cc.y());
+            cell.vertices.push_back(cc.z());
+            cell_to_vidx[ch] = vidx;
         }
-    } while (loop.inc());
+
+        // Adjacent Delaunay vertices → Voronoi neighbors + face structure
+        std::vector<Vertex_handle> adj_verts;
+        dt.adjacent_vertices(vh, std::back_inserter(adj_verts));
+
+        for (auto adj_vh : adj_verts) {
+            if (dt.is_infinite(adj_vh)) continue;
+
+            int neighbor_id = adj_vh->info();
+            // Sentinel neighbors represent the bounding-box walls
+            cell.neighbors.push_back(neighbor_id < 0 ? -1 : neighbor_id);
+
+            // Find edge (vh, adj_vh) and circulate to get ordered face vertices
+            Cell_handle ec;
+            int ei, ej;
+            dt.is_edge(vh, adj_vh, ec, ei, ej);
+
+            auto circ = dt.incident_cells(ec, ei, ej);
+            auto done = circ;
+            auto face_start = cell.face_vertices.size();
+            cell.face_vertices.push_back(0); // placeholder for vertex count
+            int n_face_verts = 0;
+            do {
+                Cell_handle ch = circ;
+                auto it = cell_to_vidx.find(ch);
+                if (it != cell_to_vidx.end()) {
+                    cell.face_vertices.push_back(it->second);
+                    ++n_face_verts;
+                }
+                ++circ;
+            } while (circ != done);
+            cell.face_vertices[face_start] = n_face_verts;
+        }
+
+        cell.volume = 0.0;
+        cells.push_back(std::move(cell));
+    }
 
     // Sort by id so the output order matches the input seed order
     std::sort(cells.begin(), cells.end(),
@@ -434,6 +509,15 @@ void write_off(const std::string& path, const InterfaceMesh& mesh) {
         for (auto idx : f) out << " " << idx;
         out << "\n";
     }
+}
+void test_orient() {
+    using K = CGAL::Exact_predicates_inexact_constructions_kernel;
+    using Point_3 = K::Point_3;
+    Point_3 p(136.49999999999997, 121.49999999999997, -21.000000000000028);
+    Point_3 q(157.5, 177.5, 35.0);
+    Point_3 r(157.5, 177.5, 30.625);
+    auto ret = CGAL::coplanar_orientation(p, q, r);
+    const auto a = 2;
 }
 
 int main(int argc, char** argv) {
