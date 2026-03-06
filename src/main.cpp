@@ -253,8 +253,7 @@ struct CellInfo {
 
 auto compute_voronoi(
     const std::vector<std::array<double, 3>>& seed_points,
-    const std::vector<std::size_t>& point_group_indices,
-    double tolerance = 1e-3
+    const std::vector<std::size_t>& point_group_indices
 ) -> InterfaceMesh {
     using K = CGAL::Exact_predicates_inexact_constructions_kernel;
     using Vb = CGAL::Triangulation_vertex_base_with_info_3<VertexInfo, K>;
@@ -314,42 +313,14 @@ auto compute_voronoi(
 
     InterfaceMesh result;
 
-    // Vertex deduplication
-    double inv_tol = 1.0 / tolerance;
-    double tol_sq = tolerance * tolerance;
-
-    auto hasher = [](const std::array<int64_t, 3>& key) -> std::size_t {
-        return boost::hash_value(key);
-    };
-
-    std::unordered_map<std::array<int64_t, 3>, std::size_t, decltype(hasher)> vertex_map(0, hasher);
-
-    auto get_or_insert = [&](double x, double y, double z) -> std::size_t {
-        int64_t ix = static_cast<int64_t>(std::floor(x * inv_tol));
-        int64_t iy = static_cast<int64_t>(std::floor(y * inv_tol));
-        int64_t iz = static_cast<int64_t>(std::floor(z * inv_tol));
-
-        // Check current cell and all 26 neighbors to handle boundary cases
-        for (int dx = -1; dx <= 1; ++dx) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dz = -1; dz <= 1; ++dz) {
-                    auto it = vertex_map.find({ix + dx, iy + dy, iz + dz});
-                    if (it != vertex_map.end()) {
-                        const auto& existing = result.vertices[it->second];
-                        double ex = x - existing[0];
-                        double ey = y - existing[1];
-                        double ez = z - existing[2];
-                        if (ex*ex + ey*ey + ez*ez < tol_sq) {
-                            return it->second;
-                        }
-                    }
-                }
-            }
+    auto get_or_insert = [&](Cell_handle ch) -> std::size_t {
+        if (ch->info().id != gpf::kInvalidIndex) {
+            return ch->info().id;
         }
-
-        std::size_t idx = result.vertices.size();
-        vertex_map.emplace(std::array<int64_t, 3>{ix, iy, iz}, idx);
-        result.vertices.push_back({x, y, z});
+        auto idx = result.vertices.size();
+        Point_3 cc = dt.dual(ch);
+        result.vertices.push_back({cc.x(), cc.y(), cc.z()});
+        ch->info().id = idx;
         return idx;
     };
 
@@ -381,8 +352,7 @@ auto compute_voronoi(
         do {
             Cell_handle ch = circ;
             if (!dt.is_infinite(ch)) {
-                Point_3 cc = dt.dual(ch);
-                auto idx = get_or_insert(cc.x(), cc.y(), cc.z());
+                auto idx = get_or_insert(ch);
                 if (face.empty() || face.back() != idx) {
                     face.push_back(idx);
                 }
@@ -435,17 +405,22 @@ void write_seed_points(const std::string& path,
 void write_off(const std::string& path, const InterfaceMesh& mesh) {
     std::ofstream out(path);
     out << "OFF\n";
-    out << mesh.vertices.size() << " " << mesh.faces.size() << " 0\n";
+    std::size_t n_triangles = 0;
+    for (const auto& f : mesh.faces) {
+        if (f.size() >= 3) n_triangles += f.size() - 2;
+    }
+    out << mesh.vertices.size() << " " << n_triangles << " 0\n";
     out << std::setprecision(17);
     for (const auto& v : mesh.vertices) {
         out << v[0] << " " << v[1] << " " << v[2] << "\n";
     }
     for (const auto& f : mesh.faces) {
-        out << f.size();
-        for (auto idx : f) out << " " << idx;
-        out << "\n";
+        for (std::size_t i = 1; i + 1 < f.size(); ++i) {
+            out << "3 " << f[0] << " " << f[i] << " " << f[i + 1] << "\n";
+        }
     }
 }
+
 void test_orient() {
     using K = CGAL::Exact_predicates_inexact_constructions_kernel;
     using Point_3 = K::Point_3;
