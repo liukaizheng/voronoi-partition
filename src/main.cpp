@@ -147,7 +147,7 @@ auto compute_edge_offset_points(
     const std::vector<std::array<double, 3>>& points,
     const Mesh& mesh,
     const std::size_t n_regions,
-    double offset = 0.001
+    double offset = 0.0001
 ) {
     using Vector3 = Eigen::Vector3d;
     std::vector<std::array<double, 3>> seed_points;
@@ -172,6 +172,7 @@ auto compute_edge_offset_points(
     };
 
     std::vector<bool> visited(mesh.n_vertices_capacity(), false);
+    constexpr double step = 0.5;
     for (auto edge : mesh.edges()) {
         auto ha = edge.halfedge();
         auto hb = ha.twin();
@@ -185,6 +186,8 @@ auto compute_edge_offset_points(
         if (region_a != region_b) {
             auto va = hb.to().id.idx;
             auto vb = ha.to().id.idx;
+            visited[va] = true;
+            visited[vb] = true;
 
             auto pa = Vector3::Map(points[va].data());
             auto pb = Vector3::Map(points[vb].data());
@@ -193,23 +196,38 @@ auto compute_edge_offset_points(
 
             auto normal_a = compute_face_normal(fa);
             auto dir_a = normal_a.cross(edge_dir).normalized().eval();
-            push_point(mid_pt + dir_a * offset, region_a);
+            // push_point(mid_pt + dir_a * offset, region_a);
 
             auto normal_b = compute_face_normal(fb);
             auto dir_b = normal_b.cross(-edge_dir).normalized().eval();
-            push_point(mid_pt + dir_b * offset, region_b);
-        }
-
-        for (auto v : mesh.vertices()) {
-            if (visited[v.id.idx])  {
-                continue;
+            // push_point(mid_pt + dir_b * offset, region_b);
+            const std::size_t n_samples = std::max(2ul, static_cast<std::size_t>(std::round(edge_dir.norm() / step)));
+            {
+                auto pt = (pa + edge_dir * 0.01).eval();
+                push_point(pt + dir_a * offset, region_a);
+                push_point(pt + dir_b * offset, region_b);
+                pt = (pa + edge_dir * 0.99).eval();
+                push_point(pt + dir_a * offset, region_a);
+                push_point(pt + dir_b * offset, region_b);
             }
-            visited[v.id.idx] = true;
-
-            auto face = v.halfedge().face();
-            seed_points.push_back(points[v.id.idx]);
-            point_group_indices.push_back(face.prop().region_index);
+            for (int i = 0; i < n_samples; ++i) {
+                double t = (i + 0.5) / n_samples;
+                auto pt = (pa + t * edge_dir).eval();
+                push_point(pt + dir_a * offset, region_a);
+                push_point(pt + dir_b * offset, region_b);
+            }
         }
+
+    }
+    for (auto v : mesh.vertices()) {
+        if (visited[v.id.idx])  {
+            continue;
+        }
+        visited[v.id.idx] = true;
+
+        auto face = v.halfedge().face();
+        seed_points.push_back(points[v.id.idx]);
+        point_group_indices.push_back(face.prop().region_index);
     }
 
     return std::make_pair(std::move(seed_points), std::move(point_group_indices));
@@ -240,12 +258,12 @@ auto compute_voronoi(
     }
 
     // Add padding so boundary cells are well-formed
-    double pad_x = (max_x - min_x) * 0.1 + 1e-6;
-    double pad_y = (max_y - min_y) * 0.1 + 1e-6;
-    double pad_z = (max_z - min_z) * 0.1 + 1e-6;
-    min_x -= pad_x; max_x += pad_x;
-    min_y -= pad_y; max_y += pad_y;
-    min_z -= pad_z; max_z += pad_z;
+    // double pad_x = (max_x - min_x) * 0.0 + 1e-6;
+    // double pad_y = (max_y - min_y) * 0.0 + 1e-6;
+    // double pad_z = (max_z - min_z) * 0.0 + 1e-6;
+    // min_x -= pad_x; max_x += pad_x;
+    // min_y -= pad_y; max_y += pad_y;
+    // min_z -= pad_z; max_z += pad_z;
 
     // Choose grid resolution based on particle count
     int n = static_cast<int>(seed_points.size());
@@ -391,6 +409,18 @@ auto extract_interface_mesh(
     return result;
 }
 
+void write_seed_points(const std::string& path,
+                       const std::vector<std::array<double, 3>>& seed_points,
+                       const std::vector<std::size_t>& point_group_indices) {
+    std::ofstream out(path);
+    out << "OFF\n";
+    out << seed_points.size() << " 0 0\n";
+    out << std::setprecision(17);
+    for (const auto& p : seed_points) {
+        out << p[0] << " " << p[1] << " " << p[2] << "\n";
+    }
+}
+
 void write_off(const std::string& path, const InterfaceMesh& mesh) {
     std::ofstream out(path);
     out << "OFF\n";
@@ -412,6 +442,8 @@ int main(int argc, char** argv) {
     std::string output_path = "interface.off";
     app.add_option("-m,--mesh", mesh_path, "Path to mesh file")->required();
     app.add_option("-o,--output", output_path, "Path to output interface mesh");
+    std::string seed_path = "seed_points.off";
+    app.add_option("-s,--seeds", seed_path, "Path to output seed points");
     CLI11_PARSE(app, argc, argv);
 
     std::vector<std::array<std::size_t, 3>> colors;
@@ -419,6 +451,7 @@ int main(int argc, char** argv) {
 
     auto [mesh, region_colors] = extract_color_boundaries(points, faces, label_face_groups);
     auto [seed_points,  point_group_indices] = compute_edge_offset_points(points, mesh, region_colors.size());
+    write_seed_points(seed_path, seed_points, point_group_indices);
 
     auto cells = compute_voronoi(seed_points);
 
