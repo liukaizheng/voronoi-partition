@@ -263,7 +263,6 @@ auto compute_voronoi(
     using Point_3 = K::Point_3;
     using Vertex_handle = Delaunay::Vertex_handle;
     using Cell_handle = Delaunay::Cell_handle;
-    using Vector3 = Eigen::Vector3d;
 
     // Compute bounding box
     double min_x = std::numeric_limits<double>::max();
@@ -367,17 +366,10 @@ auto compute_voronoi(
 
         if (face.size() < 3) continue;
 
-        // Orient: face normal should point toward vertex with smaller group index
-        auto target_id = group_a < group_b ? id_a : id_b;
-        Vector3 target_pt = Vector3::Map(seed_points[target_id].data());
-
-        Vector3 p0 = Vector3::Map(result.vertices[face[0]].data());
-        Vector3 p1 = Vector3::Map(result.vertices[face[1]].data());
-        Vector3 p2 = Vector3::Map(result.vertices[face[2]].data());
-        Vector3 face_normal = (p1 - p0).cross(p2 - p0);
-        Vector3 face_center = (p0 + p1 + p2) / 3.0;
-
-        if (face_normal.dot(target_pt - face_center) < 0) {
+        // Orient: circulation around (c, i, j) produces a polygon whose
+        // normal points toward c->vertex(i) (= va, group_a).
+        // Reverse when va has the larger group so normal points toward smaller.
+        if (group_a > group_b) {
             std::reverse(face.begin(), face.end());
         }
 
