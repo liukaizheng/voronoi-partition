@@ -3,17 +3,17 @@
 #include <CLI/CLI.hpp>
 #include <fstream>
 #include <boost/functional/hash.hpp>
+#include <print>
 #include <ranges>
 #include <deque>
 #include <algorithm>
 #include <limits>
 #include <cmath>
-#include <cstdint>
 #include <iomanip>
 
 #include <Eigen/Dense>
 #include <gpf/mesh.hpp>
-#include <unordered_set>
+#include <format>
 #include <vector>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Delaunay_triangulation_3.h>
@@ -394,21 +394,36 @@ void write_seed_points(const std::string& path,
     }
 }
 
+void write_polygon_off(const std::string& path, const InterfaceMesh& mesh) {
+    std::ofstream out(path);
+    std::println(out, "OFF");
+    std::println(out, "{} {} 0", mesh.vertices.size(), mesh.faces.size());
+    for (const auto& v : mesh.vertices) {
+        std::println(out, "{:.17g} {:.17g} {:.17g}", v[0], v[1], v[2]);
+    }
+    for (const auto& f : mesh.faces) {
+        std::print(out, "{}", f.size());
+        for (const auto& v : f) {
+            std::print(out, " {}", v);
+        }
+        std::println(out, "");
+    }
+}
+
 void write_off(const std::string& path, const InterfaceMesh& mesh) {
     std::ofstream out(path);
-    out << "OFF\n";
     std::size_t n_triangles = 0;
     for (const auto& f : mesh.faces) {
         if (f.size() >= 3) n_triangles += f.size() - 2;
     }
-    out << mesh.vertices.size() << " " << n_triangles << " 0\n";
-    out << std::setprecision(17);
+    std::println(out, "OFF");
+    std::println(out, "{} {} 0", mesh.vertices.size(), n_triangles);
     for (const auto& v : mesh.vertices) {
-        out << v[0] << " " << v[1] << " " << v[2] << "\n";
+        std::println(out, "{:.17g} {:.17g} {:.17g}", v[0], v[1], v[2]);
     }
     for (const auto& f : mesh.faces) {
         for (std::size_t i = 1; i + 1 < f.size(); ++i) {
-            out << "3 " << f[0] << " " << f[i] << " " << f[i + 1] << "\n";
+            std::println(out, "3 {} {} {}", f[0], f[i], f[i + 1]);
         }
     }
 }
@@ -441,7 +456,7 @@ int main(int argc, char** argv) {
     write_seed_points(seed_path, seed_points, point_group_indices);
 
     auto interface_mesh = compute_voronoi(seed_points, point_group_indices);
-    write_off(output_path, interface_mesh);
+    write_polygon_off(output_path, interface_mesh);
 
     std::cout << "Interface mesh: " << interface_mesh.vertices.size() << " vertices, "
               << interface_mesh.faces.size() << " faces\n";
