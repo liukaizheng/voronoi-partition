@@ -1,18 +1,27 @@
+#include <array>
+#include <gpf/detail.hpp>
 #include <gpf/ids.hpp>
+#include <gpf/surface_mesh.hpp>
 #include <iostream>
 #include <CLI/CLI.hpp>
 #include <fstream>
 #include <boost/functional/hash.hpp>
 #include <print>
+#include <filesystem>
 #include <ranges>
 #include <deque>
 #include <algorithm>
 #include <limits>
 #include <cmath>
 #include <iomanip>
+#include <sstream>
+#include <unordered_map>
 
 #include <Eigen/Dense>
 #include <gpf/mesh.hpp>
+#include <gpf/mesh_property.hpp>
+#include <gpf/mesh_upkeep.hpp>
+
 #include <format>
 #include <vector>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
@@ -381,6 +390,80 @@ auto compute_voronoi(
     return result;
 }
 
+struct VertexProp {
+    std::array<double, 3> pt;
+};
+
+struct EdgeProp {
+    double len;
+    bool need_update{false};
+};
+
+struct FaceProp {
+    std::size_t patch_id {gpf::kInvalidIndex};
+    std::size_t parent {gpf::kInvalidIndex};
+};
+
+using Mesh = gpf::SurfaceMesh<VertexProp, gpf::Empty, EdgeProp, FaceProp>;
+
+void write_triangle_soup(
+    const std::string& name,
+    const std::vector<std::array<double, 3>>& points,
+    const std::vector<std::vector<std::size_t>>& faces
+) {
+
+    std::ofstream out(name);
+    std::println(out, "OFF");
+    std::println(out, "{} {} 0", points.size(), faces.size());
+    for (const auto& v : points) {
+        std::println(out, "{:.17g} {:.17g} {:.17g}", v[0], v[1], v[2]);
+    }
+    for (const auto& f : faces) {
+        std::print(out, "{}", f.size());
+        for (const auto& v : f) {
+            std::print(out, " {}", v);
+        }
+        std::println(out, "");
+    }
+}
+
+void write_material_cells(
+    const std::string& prefix,
+    const Mesh& mesh,
+    const std::vector<std::vector<std::size_t>>& patches,
+    const std::vector<std::vector<std::size_t>>& material_cells
+) {
+    for (std::size_t mid = 0; mid < material_cells.size(); ++mid) {
+        const auto& cell_patches = material_cells[mid];
+        std::vector<std::array<double, 3>> cell_points;
+        std::vector<std::vector<std::size_t>> cell_faces;
+        std::vector<std::size_t> point_map(mesh.n_vertices_capacity(), gpf::kInvalidIndex);
+
+        for (const auto ori_pid : cell_patches) {
+            const auto [pid, reversed] = gpf::decode_index(ori_pid);
+            const auto& patch = patches[pid];
+            for (const auto fid : patch) {
+                std::vector<std::size_t> vertices;
+                for (auto he : mesh.face(gpf::FaceId{fid}).halfedges()) {
+                    auto v = he.to();
+                    auto i = v.id.idx;
+                    if (point_map[i] == gpf::kInvalidIndex) {
+                        point_map[i] = cell_points.size();
+                        cell_points.push_back(v.prop().pt);
+                    }
+                    vertices.push_back(point_map[i]);
+                }
+                if (!reversed) {
+                    std::ranges::reverse(vertices);
+                }
+                for (std::size_t i = 1; i + 1 < vertices.size(); ++i) {
+                    cell_faces.push_back({vertices[0], vertices[i], vertices[i + 1]});
+                }
+            }
+        }
+        write_triangle_soup(prefix + "_" + std::to_string(mid) + ".off", cell_points, cell_faces);
+    }
+}
 
 void write_seed_points(const std::string& path,
                        const std::vector<std::array<double, 3>>& seed_points,
@@ -408,6 +491,82 @@ void write_polygon_off(const std::string& path, const InterfaceMesh& mesh) {
         }
         std::println(out, "");
     }
+}
+
+
+auto extract_manifold_patches(const InterfaceMesh& interface) {
+    std::vector<std::array<std::size_t, 3>> triangles;
+    std::vector<std::size_t> tri_parents;
+    triangles.reserve(interface.faces.size());
+    tri_parents.reserve(interface.faces.size());
+    for (std::size_t fid = 0; fid < interface.faces.size(); fid++) {
+        const auto& vertices = interface.faces[fid];
+        for (std::size_t i = 1; i + 1 < vertices.size(); ++i) {
+            triangles.push_back({vertices[0], vertices[i], vertices[i + 1]});
+            tri_parents.emplace_back(fid);
+        }
+    }
+
+    auto mesh = Mesh::new_in(triangles);
+    for (std::size_t i = 0; i < interface.vertices.size(); i++) {
+        mesh.vertex(gpf::VertexId{i}).prop().pt = interface.vertices[i];
+    }
+
+    for (std::size_t i = 0; i < tri_parents.size(); i++) {
+        mesh.face(gpf::FaceId{i}).prop().parent = tri_parents[i];
+    }
+
+    gpf::update_edge_lengths<3>(mesh);
+    gpf::collapse_short_edges(mesh, 0.02);
+
+    for (std::size_t i = 0; i < interface.vertices.size(); i++) {
+        mesh.vertex(gpf::VertexId{i}).prop().pt = interface.vertices[i];
+    }
+
+    std::vector<std::vector<std::size_t>> patches;
+    for (const auto face : mesh.faces()) {
+        if (face.prop().patch_id != gpf::kInvalidIndex) {
+            continue;
+        }
+        const auto patch_id = patches.size();
+        face.prop().patch_id = patch_id;
+        std::vector<std::size_t> patch {face.id.idx};
+        for (std::size_t i = 0; i < patch.size(); i++) {
+            for (const auto he : mesh.face(gpf::FaceId{patch[i]}).halfedges()) {
+                if (he.sibling().sibling().id != he.id) {
+                    continue;
+                }
+
+                // If this edge is manifold-edge
+                auto h = he.sibling();
+                auto f = h.face();
+                auto& f_props = f.data().property;
+                if (f_props.patch_id == gpf::kInvalidIndex) {
+                    f_props.patch_id = patch_id;
+                    patch.emplace_back(f.id.idx);
+                }
+            }
+        }
+        patches.emplace_back(std::move(patch));
+    }
+    return std::make_tuple(std::move(patches), std::move(mesh));
+}
+
+auto extract_material_cells(const InterfaceMesh& interface, const std::size_t n_materials) {
+    const auto [patches, mesh] = extract_manifold_patches(interface);
+    auto patch_materials = patches | views::transform([&interface, &mesh](const auto& patch) {
+        return interface.face_groups[mesh.face_prop(gpf::FaceId{patch.front()}).parent];
+    }) | ranges::to<std::vector>();
+
+    std::vector<std::vector<std::size_t>> material_patches(n_materials);
+    for (std::size_t i = 0; i < patch_materials.size(); ++i) {
+        const auto& materials = patch_materials[i];
+        material_patches[materials[0]].emplace_back(gpf::oriented_index(i, false));
+        if (materials[1] != gpf::kInvalidIndex) {
+            material_patches[materials[1]].emplace_back(gpf::oriented_index(i, true));
+        }
+    }
+    return std::make_tuple(std::move(mesh), std::move(patches), std::move(material_patches));
 }
 
 void write_off(const std::string& path, const InterfaceMesh& mesh) {
@@ -455,10 +614,19 @@ int main(int argc, char** argv) {
     auto [seed_points,  point_group_indices] = compute_edge_offset_points(points, mesh, region_colors.size());
     write_seed_points(seed_path, seed_points, point_group_indices);
 
-    auto interface_mesh = compute_voronoi(seed_points, point_group_indices);
-    write_polygon_off(output_path, interface_mesh);
+    auto interface_data = compute_voronoi(seed_points, point_group_indices);
+    auto [interface_mesh, patches, group_patches] = extract_material_cells(interface_data, region_colors.size());
+    {
+        std::vector<std::vector<std::size_t>> patch_indices;
+        for (std::size_t i = 0; i < patches.size(); i++) {
+            patch_indices.push_back({i * 2});
+        }
+        write_material_cells("patch", interface_mesh, patches, patch_indices);
+    }
+    write_polygon_off(output_path, interface_data);
+    write_material_cells("material", interface_mesh, patches, group_patches);
 
-    std::cout << "Interface mesh: " << interface_mesh.vertices.size() << " vertices, "
-              << interface_mesh.faces.size() << " faces\n";
+    std::cout << "Interface mesh: " << interface_data.vertices.size() << " vertices, "
+              << interface_data.faces.size() << " faces\n";
     std::cout << "Written to: " << output_path << "\n";
 }
