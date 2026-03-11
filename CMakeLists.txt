@@ -12,6 +12,20 @@ include(cmake/CPM.cmake)
 CPMAddPackage("gh:CLIUtils/CLI11#v2.6.1")
 CPMAddPackage("gh:liukaizheng/gpf-algorithm#main")
 find_package(CGAL REQUIRED)
+if(NOT TARGET CGAL::CGAL_Core)
+    add_library(CGAL::CGAL_Core INTERFACE IMPORTED)
+    set_target_properties(CGAL::CGAL_Core PROPERTIES
+        INTERFACE_LINK_LIBRARIES CGAL::CGAL
+    )
+endif()
+find_package(Eigen3 REQUIRED)
+CPMAddPackage(
+    NAME libigl
+    GIT_TAG main
+    GITHUB_REPOSITORY liukaizheng/libigl
+    OPTIONS
+        "LIBIGL_COPYLEFT_CGAL ON"
+)
 
 add_executable(voronoi-partition
     src/main.cpp
@@ -22,6 +36,8 @@ target_link_libraries(voronoi-partition PRIVATE
     CLI11::CLI11
     gpf::algorithm
     CGAL::CGAL
+    igl::core
+    igl_copyleft::cgal
 )
 target_include_directories(voronoi-partition PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

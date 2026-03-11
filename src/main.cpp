@@ -22,6 +22,9 @@
 #include <gpf/mesh_property.hpp>
 #include <gpf/mesh_upkeep.hpp>
 
+#include <igl/copyleft/cgal/mesh_boolean.h>
+#include <igl/MeshBooleanType.h>
+
 #include <format>
 #include <vector>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
@@ -453,7 +456,7 @@ void write_material_cells(
                     }
                     vertices.push_back(point_map[i]);
                 }
-                if (!reversed) {
+                if (reversed) {
                     std::ranges::reverse(vertices);
                 }
                 for (std::size_t i = 1; i + 1 < vertices.size(); ++i) {
@@ -587,6 +590,73 @@ void write_off(const std::string& path, const InterfaceMesh& mesh) {
     }
 }
 
+auto input_mesh_to_eigen(
+    const std::vector<std::array<double, 3>>& points,
+    const std::vector<std::vector<std::size_t>>& faces
+) {
+    Eigen::MatrixXd V(points.size(), 3);
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        V.row(i) << points[i][0], points[i][1], points[i][2];
+    }
+    std::size_t n_triangles = 0;
+    for (const auto& f : faces) {
+        if (f.size() >= 3) n_triangles += f.size() - 2;
+    }
+    Eigen::MatrixXi F(n_triangles, 3);
+    std::size_t row = 0;
+    for (const auto& f : faces) {
+        for (std::size_t i = 1; i + 1 < f.size(); ++i) {
+            F.row(row++) << static_cast<int>(f[0]), static_cast<int>(f[i]), static_cast<int>(f[i + 1]);
+        }
+    }
+    return std::make_pair(std::move(V), std::move(F));
+}
+
+auto extract_cell_eigen(
+    const Mesh& mesh,
+    const std::vector<std::vector<std::size_t>>& patches,
+    const std::vector<std::size_t>& cell_patches
+) {
+    std::vector<std::array<double, 3>> cell_points;
+    std::vector<std::array<std::size_t, 3>> cell_triangles;
+    std::vector<std::size_t> point_map(mesh.n_vertices_capacity(), gpf::kInvalidIndex);
+
+    for (const auto ori_pid : cell_patches) {
+        const auto [pid, reversed] = gpf::decode_index(ori_pid);
+        const auto& patch = patches[pid];
+        for (const auto fid : patch) {
+            std::vector<std::size_t> vertices;
+            for (auto he : mesh.face(gpf::FaceId{fid}).halfedges()) {
+                auto v = he.to();
+                auto i = v.id.idx;
+                if (point_map[i] == gpf::kInvalidIndex) {
+                    point_map[i] = cell_points.size();
+                    cell_points.push_back(v.prop().pt);
+                }
+                vertices.push_back(point_map[i]);
+            }
+            if (!reversed) {
+                std::ranges::reverse(vertices);
+            }
+            for (std::size_t i = 1; i + 1 < vertices.size(); ++i) {
+                cell_triangles.push_back({vertices[0], vertices[i], vertices[i + 1]});
+            }
+        }
+    }
+
+    Eigen::MatrixXd V(cell_points.size(), 3);
+    for (std::size_t i = 0; i < cell_points.size(); ++i) {
+        V.row(i) << cell_points[i][0], cell_points[i][1], cell_points[i][2];
+    }
+    Eigen::MatrixXi F(cell_triangles.size(), 3);
+    for (std::size_t i = 0; i < cell_triangles.size(); ++i) {
+        F.row(i) << static_cast<int>(cell_triangles[i][0]),
+                     static_cast<int>(cell_triangles[i][1]),
+                     static_cast<int>(cell_triangles[i][2]);
+    }
+    return std::make_pair(std::move(V), std::move(F));
+}
+
 void test_orient() {
     using K = CGAL::Exact_predicates_inexact_constructions_kernel;
     using Point_3 = K::Point_3;
@@ -625,6 +695,29 @@ int main(int argc, char** argv) {
     }
     write_polygon_off(output_path, interface_data);
     write_material_cells("material", interface_mesh, patches, group_patches);
+
+    auto [VA, FA] = input_mesh_to_eigen(points, faces);
+    for (std::size_t mid = 0; mid < group_patches.size(); ++mid) {
+        auto [VB, FB] = extract_cell_eigen(interface_mesh, patches, group_patches[mid]);
+        if (FB.rows() == 0) continue;
+        Eigen::MatrixXd VC;
+        Eigen::MatrixXi FC;
+        igl::copyleft::cgal::mesh_boolean(VA, FA, VB, FB,
+            igl::MESH_BOOLEAN_TYPE_INTERSECT, VC, FC);
+        if (FC.rows() == 0) continue;
+
+        std::vector<std::array<double, 3>> out_points(VC.rows());
+        for (int i = 0; i < VC.rows(); ++i) {
+            out_points[i] = {VC(i, 0), VC(i, 1), VC(i, 2)};
+        }
+        std::vector<std::vector<std::size_t>> out_faces(FC.rows());
+        for (int i = 0; i < FC.rows(); ++i) {
+            out_faces[i] = {static_cast<std::size_t>(FC(i, 0)),
+                            static_cast<std::size_t>(FC(i, 1)),
+                            static_cast<std::size_t>(FC(i, 2))};
+        }
+        write_triangle_soup("clipped_material_" + std::to_string(mid) + ".off", out_points, out_faces);
+    }
 
     std::cout << "Interface mesh: " << interface_data.vertices.size() << " vertices, "
               << interface_data.faces.size() << " faces\n";
